@@ -1,0 +1,1195 @@
+<html lang="ko"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              window.parent.postMessage({
+                type: 'screenshotData',
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="영단어 게임">
+<title>영단어 스펠링 게임</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;color:#1d1d1f;min-height:100vh;}
+#app{max-width:600px;margin:0 auto;padding:16px;}
+button{font-family:inherit;border:none;outline:none;cursor:pointer;}
+input{font-family:inherit;outline:none;}
+
+/* colors */
+:root{
+  --bg:#f5f5f7;--card:#ffffff;--border:#d2d2d7;--border2:#e5e5ea;
+  --text:#1d1d1f;--text2:#6e6e73;--text3:#aeaeb2;
+  --green:#34c759;--green-bg:#e9f9ed;--green-text:#1a7a38;
+  --red:#ff3b30;--red-bg:#fff0ef;--red-text:#a82019;
+  --blue:#007aff;--blue-bg:#e8f2ff;--blue-text:#003d99;
+  --yellow:#ff9f0a;--yellow-bg:#fff8e6;
+  --navy:#0f1f4a;
+}
+
+.card{background:var(--card);border:1px solid var(--border2);border-radius:16px;padding:16px;}
+.btn{padding:10px 18px;border-radius:12px;font-size:14px;font-weight:500;border:1px solid var(--border);background:var(--card);color:var(--text);transition:opacity 0.1s;}
+.btn:active{opacity:0.7;}
+.btn-primary{background:var(--navy);color:white;border-color:var(--navy);}
+.btn-green{background:var(--green-bg);color:var(--green-text);border-color:#a3d9b1;}
+.btn-red{background:var(--red-bg);color:var(--red-text);border-color:#f4a9a4;}
+.btn-blue{background:var(--blue-bg);color:var(--blue-text);border-color:#a3c4f5;}
+
+/* progress bar */
+.progress-wrap{position:relative;width:100%;height:140px;margin-bottom:14px;}
+.progress-track{position:absolute;bottom:0;left:0;right:0;height:28px;background:var(--border2);border-radius:14px;overflow:hidden;}
+.progress-fill{height:100%;border-radius:14px;transition:width 0.9s cubic-bezier(.4,0,.2,1);}
+.bear-wrap{position:absolute;bottom:24px;transition:left 0.9s cubic-bezier(.2,0,.8,1);}
+.flag{position:absolute;bottom:24px;right:0;font-size:18px;}
+
+/* select grid */
+.day-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;}
+.day-card{background:var(--card);border:1.5px solid var(--border2);border-radius:14px;padding:14px;cursor:pointer;text-align:left;position:relative;transition:border-color 0.15s;}
+.day-card.cleared{border-color:var(--red);}
+.clear-badge{position:absolute;top:-10px;right:-10px;width:38px;height:38px;border-radius:50%;background:var(--red);display:flex;align-items:center;justify-content:center;flex-direction:column;box-shadow:0 2px 6px rgba(255,59,48,0.35);}
+.clear-badge span{font-size:7px;font-weight:700;color:white;line-height:1.2;}
+
+/* hint row */
+.hint-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;}
+.hint-btn{font-size:11px;padding:5px 10px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text2);}
+.hint-btn:disabled{opacity:0.35;}
+.hint-btn.red{color:var(--red);border-color:#f4a9a4;}
+
+/* answer row */
+.answer-row{display:flex;gap:8px;}
+.answer-input{flex:1;font-size:16px;padding:10px 14px;border-radius:12px;border:1.5px solid var(--border);background:#f5f5f7;color:var(--text);letter-spacing:0.04em;}
+.answer-input:focus{border-color:var(--blue);}
+
+/* feedback */
+.feedback{padding:10px 14px;border-radius:12px;text-align:center;font-size:14px;font-weight:500;margin-top:10px;}
+.feedback.correct{background:var(--green-bg);color:var(--green-text);}
+.feedback.wrong{background:var(--red-bg);color:var(--red-text);}
+
+/* stats grid */
+.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px;}
+.stat-card{background:var(--border2);border-radius:12px;padding:12px;text-align:center;}
+
+/* goal bar */
+.goal-bar-wrap{height:8px;background:var(--border2);border-radius:4px;overflow:hidden;margin-top:6px;}
+.goal-bar-fill{height:100%;border-radius:4px;transition:width 0.5s;}
+
+/* speed timer */
+.timer-wrap{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
+.timer-track{flex:1;height:6px;background:var(--border2);border-radius:3px;overflow:hidden;}
+.timer-fill{height:100%;border-radius:3px;transition:width 1s linear;}
+
+/* combo badge */
+.combo-badge{font-size:12px;font-weight:600;color:var(--red);background:var(--red-bg);padding:2px 8px;border-radius:6px;}
+
+/* animations */
+@keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-0.8px)}}
+@keyframes legL{0%,100%{transform:rotate(28deg)}50%{transform:rotate(-28deg)}}
+@keyframes legR{0%,100%{transform:rotate(-28deg)}50%{transform:rotate(28deg)}}
+@keyframes armL{0%,100%{transform:rotate(-22deg)}50%{transform:rotate(22deg)}}
+@keyframes armR{0%,100%{transform:rotate(22deg)}50%{transform:rotate(-22deg)}}
+@keyframes tilt{0%,100%{transform:rotate(-3deg)}50%{transform:rotate(3deg)}}
+@keyframes idleBob{0%,100%{transform:translateY(0)}50%{transform:translateY(-0.4px)}}
+.run-body{animation:bob 0.35s ease-in-out infinite}
+.run-tilt{transform-origin:18px 18px;animation:tilt 0.35s ease-in-out infinite}
+.run-legL{transform-origin:15px 30px;animation:legL 0.35s ease-in-out infinite}
+.run-legR{transform-origin:21px 30px;animation:legR 0.35s ease-in-out infinite}
+.run-armL{transform-origin:11px 20px;animation:armL 0.35s ease-in-out infinite}
+.run-armR{transform-origin:25px 20px;animation:armR 0.35s ease-in-out infinite}
+.idle-body{animation:idleBob 1.2s ease-in-out infinite}
+
+/* modal overlay */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.4);display:flex;align-items:center;justify-content:center;z-index:100;padding:16px;}
+.modal{background:var(--card);border-radius:20px;padding:20px;width:100%;max-width:380px;}
+
+/* review badge */
+.review-badge{font-size:11px;color:#854F0B;background:#FAEEDA;padding:2px 8px;border-radius:6px;}
+
+/* topbar */
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;}
+.topbar-right{display:flex;gap:6px;align-items:center;}
+.level-badge{background:var(--blue-bg);color:var(--blue-text);font-size:12px;font-weight:500;padding:3px 10px;border-radius:8px;}
+.music-btn{font-size:12px;padding:3px 10px;border-radius:8px;border:1px solid var(--border);background:var(--card);}
+.music-btn.on{background:var(--green-bg);color:var(--green-text);border-color:#a3d9b1;}
+
+.hint-box{border-radius:10px;padding:8px 12px;font-size:13px;margin-bottom:8px;}
+.hint-box.green{background:#f0faf3;border-left:3px solid var(--green);}
+.hint-box.yellow{background:var(--yellow-bg);border-left:3px solid var(--yellow);}
+.hint-box.red{background:var(--red-bg);border-left:3px solid var(--red);}
+
+.word-count-badge{font-size:12px;color:var(--text2);background:#f5f5f7;padding:2px 10px;border-radius:8px;border:1px solid var(--border2);}
+
+.section-title{font-size:11px;color:var(--text2);margin-bottom:4px;}
+.score-row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;}
+.score-num{font-size:26px;font-weight:500;}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div id="app"><div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px">
+        <div>
+          <div style="font-size:20px;font-weight:600">영단어 스펠링 게임</div>
+          <div style="font-size:12px;color:var(--text2);margin-top:2px">숙명여고 2학년 1학기</div>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="music-btn " onclick="toggleMusic()" style="font-size:13px;padding:6px 12px">♪ OFF</button>
+          <button class="btn" style="font-size:12px;padding:6px 12px" onclick="setState({showGoalModal:true})">🎯 목표</button>
+          <button class="btn btn-blue" style="font-size:12px;padding:6px 12px" onclick="downloadHTML()">⬇️ 저장</button>
+        </div>
+      </div>
+      
+      <div class="day-grid">
+        <button class="day-card " onclick="startDay('Day 11')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 11</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">15개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 12')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 12</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">16개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 13')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 13</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">14개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 14')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 14</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">14개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 15')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 15</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">13개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 16')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 16</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">14개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 17')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 17</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">13개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 18')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 18</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">12개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 19')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 19</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">13개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 20')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 20</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">13개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 21')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 21</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">19개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 45')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 45</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">25개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button><button class="day-card " onclick="startDay('Day 46')">
+            
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">Day 46</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:10px">27개 단어</div>
+            <div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>
+          </button>
+      </div>
+      <div class="card" style="margin-top:14px;display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <div style="font-size:13px;font-weight:500">⚡ 스피드 모드</div>
+          <div style="font-size:11px;color:var(--text2)">15초 안에 답하기!</div>
+        </div>
+        <select onchange="if(this.value){startDay(this.value,true);this.value='';}" style="font-size:12px;padding:6px 10px;border-radius:10px;border:1px solid var(--border);background:var(--card);color:var(--text)">
+          <option value="" disabled="" selected="">Day 선택</option>
+          <option value="Day 11">Day 11</option><option value="Day 12">Day 12</option><option value="Day 13">Day 13</option><option value="Day 14">Day 14</option><option value="Day 15">Day 15</option><option value="Day 16">Day 16</option><option value="Day 17">Day 17</option><option value="Day 18">Day 18</option><option value="Day 19">Day 19</option><option value="Day 20">Day 20</option><option value="Day 21">Day 21</option><option value="Day 45">Day 45</option><option value="Day 46">Day 46</option>
+        </select>
+      </div>
+    </div></div>
+
+<script>
+const DAYS = {
+"Day 11":[
+  {word:"abuse monopoly",meaning:"독점권을 남용하다",hint2:"abuse=남용하다 / monopoly=독점"},
+  {word:"outrageous",meaning:"터무니없는",hint2:"rage(분노)가 들어있어요"},
+  {word:"intrinsic motivation",meaning:"내적 동기",hint2:"intrinsic=내재적인 / motivation=동기"},
+  {word:"dwindle away to nothing",meaning:"완전히 없어지다",hint2:"dwindle=점점 줄다"},
+  {word:"strict upbringing",meaning:"엄격한 교육",hint2:"strict=엄격한 / upbringing=양육"},
+  {word:"meteorology",meaning:"기상학",hint2:"meteor(대기현상) + logy(학문)"},
+  {word:"climatology",meaning:"기후학",hint2:"climate(기후) + logy(학문)"},
+  {word:"scarcity",meaning:"부족",hint2:"scarce(부족한) + ity(상태)"},
+  {word:"sensible",meaning:"분별 있는",hint2:"sense(판단력)에서 왔어요"},
+  {word:"sensitive",meaning:"민감한",hint2:"sense(감각)에서 왔어요"},
+  {word:"benevolent",meaning:"자비로운",hint2:"bene=좋은 / volent=바라는"},
+  {word:"malevolent",meaning:"사악한",hint2:"male=나쁜 / volent=바라는"},
+  {word:"provision",meaning:"식량/공급하다",hint2:"pro(앞서) + vision(보다)"},
+  {word:"be taken into custody",meaning:"구금되다",hint2:"custody=구금"},
+  {word:"adequate",meaning:"충분한/적절한",hint2:"ad + equate(같게하다)"},
+],
+"Day 12":[
+  {word:"impart",meaning:"나누어 주다/전달하다",hint2:"im(안으로) + part(부분)"},
+  {word:"hectic",meaning:"정신없이 바쁜",hint2:"hect(100배)처럼 활동이 넘쳐남"},
+  {word:"warehouse",meaning:"창고",hint2:"ware(상품) + house(집)"},
+  {word:"vital",meaning:"필수적인",hint2:"vita(생명)에서 왔어요"},
+  {word:"trigger",meaning:"촉발하다",hint2:"총의 방아쇠에서 유래"},
+  {word:"immune",meaning:"면역이 있는",hint2:"im(부정) + mune(의무)"},
+  {word:"exempt",meaning:"면제된",hint2:"ex(밖으로) + empt(가져가다)"},
+  {word:"hail",meaning:"환호하다/택시를 부르다",hint2:"h로 시작, 4글자"},
+  {word:"acclaim",meaning:"환호하다/칭찬하다",hint2:"ac + claim(외치다)"},
+  {word:"barbaric",meaning:"야만적인",hint2:"barbar(외국어처럼 들리는 말)"},
+  {word:"detest",meaning:"혐오하다",hint2:"de(강조) + test → 강하게 싫어함"},
+  {word:"loathe",meaning:"혐오하다/역겨워하다",hint2:"l로 시작, 6글자"},
+  {word:"tremendous",meaning:"거대한/엄청난",hint2:"tremen(떨다) → 떨릴 만큼 큰"},
+  {word:"surround",meaning:"에워싸다",hint2:"sur(위) + round(둥글게)"},
+  {word:"boast",meaning:"자랑하다",hint2:"b로 시작, 5글자"},
+  {word:"be apt to",meaning:"~하는 경향이 있다",hint2:"apt=경향 있는"},
+],
+"Day 13":[
+  {word:"fluid",meaning:"액체/유동적인",hint2:"flu(흐르다)에서 왔어요"},
+  {word:"fluid assets",meaning:"유동자산",hint2:"fluid=유동적인 / assets=자산"},
+  {word:"wander",meaning:"배회하다/방황하다",hint2:"wan + der → 힘없이 걷다"},
+  {word:"acquaintance",meaning:"아는 사람/지인",hint2:"acquaint(알게 되다) + ance"},
+  {word:"ignorance",meaning:"무지",hint2:"ignore(무시하다) + ance"},
+  {word:"radical",meaning:"급진주의자/급진적인",hint2:"radic(뿌리) → 근본적 변화"},
+  {word:"meticulous",meaning:"세심한/꼼꼼한",hint2:"meti(조심하다) + culous"},
+  {word:"intimate",meaning:"친근한/매우 가까운",hint2:"intim(가장 안쪽)"},
+  {word:"intimidate",meaning:"위협하다/겁주다",hint2:"intimate에서 나왔지만 반대 느낌!"},
+  {word:"proponent",meaning:"지지자/옹호자",hint2:"pro(찬성) + ponent"},
+  {word:"opponent",meaning:"반대자/상대방",hint2:"op(반대) + ponent"},
+  {word:"subsidy",meaning:"보조금",hint2:"sub(아래서) + sid(앉다)"},
+  {word:"deprive A of B",meaning:"A에게서 B를 빼앗다",hint2:"deprive=박탈하다"},
+  {word:"derive from",meaning:"유래되다",hint2:"de + rive(강) → 흘러나오다"},
+],
+"Day 14":[
+  {word:"irate",meaning:"화가 난/격노한",hint2:"ir(화난) + ate"},
+  {word:"offspring",meaning:"자식/자손",hint2:"off + spring(탄생)"},
+  {word:"descendant",meaning:"자손",hint2:"de(아래로) + scend(내려가다)"},
+  {word:"ancestor",meaning:"조상",hint2:"ante(앞에) + cestor(가다)"},
+  {word:"guarantee",meaning:"보증하다/보증서",hint2:"g로 시작, 9글자"},
+  {word:"superficial",meaning:"피상적인",hint2:"super(위) + ficial(표면)"},
+  {word:"deteriorate",meaning:"악화되다",hint2:"de + terior(더 나쁜) + ate"},
+  {word:"contemporary",meaning:"현대의/동시대의",hint2:"con + tempor(시간)"},
+  {word:"setback",meaning:"패배/좌절",hint2:"set(되돌리다) + back(뒤로)"},
+  {word:"underscore",meaning:"강조하다",hint2:"under(아래) + score(선)"},
+  {word:"invaluable",meaning:"매우 귀중한",hint2:"in(부정) + valuable"},
+  {word:"ceasefire",meaning:"휴전/사격 중지",hint2:"cease(멈추다) + fire(발포)"},
+  {word:"penetrate",meaning:"관통하다/침투하다",hint2:"pene(안으로) + trate(통과)"},
+  {word:"at the mercy of",meaning:"~에 좌지우지되는",hint2:"mercy=자비"},
+],
+"Day 15":[
+  {word:"entrust",meaning:"맡기다/위탁하다",hint2:"en + trust(신뢰)"},
+  {word:"eccentric",meaning:"별난/괴짜 같은",hint2:"ec(밖으로) + centric(중심)"},
+  {word:"irresistible",meaning:"저항할 수 없는",hint2:"ir(부정) + resistible"},
+  {word:"overwhelming",meaning:"압도적인",hint2:"over(넘치는) + whelm(덮다)"},
+  {word:"fasting",meaning:"단식/금식",hint2:"fast(단식) + ing"},
+  {word:"impending",meaning:"임박한",hint2:"im + pend(매달리다)"},
+  {word:"imminent",meaning:"임박한",hint2:"im + minent(튀어나온)"},
+  {word:"hatch a plot",meaning:"음모를 꾸미다",hint2:"hatch=알을 깨다"},
+  {word:"imperative",meaning:"반드시 해야 하는/명령",hint2:"imper(명령하다) + ative"},
+  {word:"coincide",meaning:"일치하다/동시에 일어나다",hint2:"co(함께) + incide(일어나다)"},
+  {word:"retain",meaning:"보유하다/유지하다",hint2:"re(다시) + tain(잡다)"},
+  {word:"ambiguity",meaning:"모호성/애매함",hint2:"ambi(양쪽) + guity"},
+  {word:"scrutinize",meaning:"면밀히 조사하다",hint2:"scrutin(세밀히 보다) + ize"},
+],
+"Day 16":[
+  {word:"gaze",meaning:"응시하다",hint2:"g로 시작, 4글자"},
+  {word:"rational",meaning:"이성적인/현명한",hint2:"ratio(이성) + nal"},
+  {word:"beneficial",meaning:"유익한",hint2:"bene(좋은) + ficial"},
+  {word:"catastrophe",meaning:"재해/대재앙",hint2:"cata(아래로) + strophe(돌리다)"},
+  {word:"overlook",meaning:"간과하다/내려다보다",hint2:"over(위에서) + look(보다)"},
+  {word:"trespass",meaning:"침범하다/무단침입",hint2:"tres(넘어서) + pass(지나가다)"},
+  {word:"antipathy",meaning:"반감",hint2:"anti(반대) + pathy(감정)"},
+  {word:"apathy",meaning:"무관심",hint2:"a(없는) + pathy(감정)"},
+  {word:"revenue",meaning:"수입/매출",hint2:"re(돌아오다) + venue"},
+  {word:"devastate",meaning:"파괴하다/황폐화시키다",hint2:"de(완전히) + vast(넓은) + ate"},
+  {word:"integrity",meaning:"진실성/완전한 상태",hint2:"integ(온전한) + rity"},
+  {word:"uproot",meaning:"근절하다/뿌리째 뽑다",hint2:"up + root(뿌리)"},
+  {word:"noxious fumes",meaning:"유독가스",hint2:"nox(독) + ious"},
+  {word:"attribute A to B",meaning:"A를 B 탓으로 돌리다",hint2:"attrib(귀속) + ute"},
+],
+"Day 17":[
+  {word:"evident",meaning:"명백한",hint2:"e + vident(보이는)"},
+  {word:"apparent",meaning:"명백한/겉으로 드러난",hint2:"ap + parent(나타나는)"},
+  {word:"deliberately",meaning:"의도적으로",hint2:"deliberate(신중한) + ly"},
+  {word:"stimulate",meaning:"자극하다/촉진하다",hint2:"stimul(자극) + ate"},
+  {word:"feel elated",meaning:"마음이 들뜨다",hint2:"e + late(올리다) + d"},
+  {word:"refute",meaning:"반박하다",hint2:"re(다시) + fute(부수다)"},
+  {word:"confidential",meaning:"기밀의/비밀의",hint2:"confide(비밀 말하다) + ntial"},
+  {word:"manifest",meaning:"나타내다/분명한",hint2:"mani(손) + fest(잡다)"},
+  {word:"sophisticated",meaning:"정교한/세련된",hint2:"sophist(현명한) + icated"},
+  {word:"in jeopardy",meaning:"위험에 처한",hint2:"jeopard(위험) + y"},
+  {word:"cohesive",meaning:"결속력 있는",hint2:"co(함께) + hesive(달라붙는)"},
+  {word:"adolescent",meaning:"청소년기의",hint2:"adol(성장하다) + escent"},
+  {word:"ward off",meaning:"예방하다/막아내다",hint2:"ward(지키다) + off"},
+],
+"Day 18":[
+  {word:"severe",meaning:"심각한/엄격한",hint2:"sev(끊다) + ere"},
+  {word:"hibernate",meaning:"동면하다",hint2:"hiber(겨울) + nate"},
+  {word:"pinnacle",meaning:"정점/최고점",hint2:"pinn(뾰족한) + acle"},
+  {word:"acute",meaning:"날카로운/급성의",hint2:"acu(바늘) + te"},
+  {word:"nocturnal",meaning:"야행성의",hint2:"noct(밤) + urnal"},
+  {word:"frantic",meaning:"흥분한/제정신이 아닌",hint2:"frant(광기) + ic"},
+  {word:"predominant",meaning:"두드러진/지배적인",hint2:"pre(앞에) + dominant"},
+  {word:"sporadic",meaning:"불규칙적으로 발생하는",hint2:"spor(흩어진) + adic"},
+  {word:"intermittent",meaning:"간헐적인",hint2:"inter(사이) + mittent(보내다)"},
+  {word:"sanction",meaning:"제재/승인",hint2:"sanct(신성한) + ion"},
+  {word:"embargo",meaning:"제재/무역금지",hint2:"em + bargo(막다)"},
+  {word:"make the most of",meaning:"최대한 이용하다",hint2:"most=최대"},
+],
+"Day 19":[
+  {word:"trait",meaning:"특성/성격적 특성",hint2:"t로 시작, 5글자"},
+  {word:"humility",meaning:"겸손",hint2:"humil(땅,낮은) + ity"},
+  {word:"humiliation",meaning:"굴욕/수치",hint2:"humil(낮추다) + iation"},
+  {word:"predator",meaning:"약탈자/포식자",hint2:"pred(잡다) + ator"},
+  {word:"exotic",meaning:"이국적인/외래의",hint2:"exo(밖의) + tic"},
+  {word:"prophecy",meaning:"예언",hint2:"prophet(예언자) + cy"},
+  {word:"surplus",meaning:"잉여/나머지",hint2:"sur(위에) + plus(더)"},
+  {word:"shortage",meaning:"부족",hint2:"short(부족한) + age"},
+  {word:"vertical",meaning:"수직의",hint2:"vert(돌리다) + ical"},
+  {word:"horizontal",meaning:"수평의",hint2:"horizon(지평선) + tal"},
+  {word:"collapse",meaning:"무너지다/붕괴하다",hint2:"col + lapse(미끄러지다)"},
+  {word:"proportion",meaning:"비율/비중",hint2:"pro + portion(부분)"},
+  {word:"meritocracy",meaning:"능력주의",hint2:"merit(능력) + cracy(지배)"},
+],
+"Day 20":[
+  {word:"competent",meaning:"유능한/능력 있는",hint2:"compet(경쟁하다) + ent"},
+  {word:"identical twins",meaning:"일란성 쌍둥이",hint2:"identical=동일한 / twins=쌍둥이"},
+  {word:"accelerate",meaning:"가속하다",hint2:"ac + celer(빠른) + ate"},
+  {word:"decelerate",meaning:"감속하다",hint2:"de(반대) + accelerate"},
+  {word:"solidify",meaning:"견고하게 하다/굳히다",hint2:"solid(고체) + ify"},
+  {word:"a plausible excuse",meaning:"그럴듯한 변명",hint2:"plausible=그럴듯한"},
+  {word:"mingle",meaning:"섞이다/어울리다",hint2:"ming(섞다) + le"},
+  {word:"kneel",meaning:"무릎을 꿇다",hint2:"knee(무릎) + l"},
+  {word:"aggregation",meaning:"집단/집합",hint2:"ag + greg(무리) + ation"},
+  {word:"reap what you have sown",meaning:"뿌린 대로 거두다",hint2:"reap=거두다 / sow=씨 뿌리다"},
+  {word:"embark",meaning:"시작하다/착수하다",hint2:"em + bark(배)"},
+  {word:"monetary",meaning:"화폐의/금전의",hint2:"monet(돈) + ary"},
+  {word:"in the long run",meaning:"결국에/장기적으로",hint2:"run=흐름 → 긴 흐름 끝에"},
+],
+"Day 21":[
+  {word:"exquisite",meaning:"우아한",hint2:"ex(밖으로) + quis(찾다) → 정교하게 찾아낸"},
+  {word:"graceful",meaning:"우아한",hint2:"grace(우아함) + ful"},
+  {word:"merger and acquisition",meaning:"인수합병",hint2:"merger=합병 / acquisition=인수"},
+  {word:"genuine",meaning:"진짜의",hint2:"genu(태생의) + ine → 타고난 진짜"},
+  {word:"authentic",meaning:"진짜의",hint2:"auth(스스로) + entic"},
+  {word:"fake",meaning:"가짜의",hint2:"f로 시작, 4글자"},
+  {word:"implore",meaning:"탄원하다/애원하다",hint2:"im + plore(울다) → 울며 빌다"},
+  {word:"toil",meaning:"수고/힘들게 일하다",hint2:"t로 시작, 4글자"},
+  {word:"withhold",meaning:"보류하다/억제하다",hint2:"with(반대) + hold(잡다)"},
+  {word:"inanimate",meaning:"생명 없는",hint2:"in(부정) + animate(생명있는)"},
+  {word:"clockwise",meaning:"시계방향으로",hint2:"clock(시계) + wise(방향)"},
+  {word:"anticlockwise",meaning:"반시계방향으로",hint2:"anti(반대) + clockwise"},
+  {word:"amnesia",meaning:"기억상실",hint2:"a(없는) + mnesia(기억)"},
+  {word:"culprit",meaning:"범죄자",hint2:"culp(잘못) + rit"},
+  {word:"dignity",meaning:"위엄",hint2:"digni(가치있는) + ty"},
+  {word:"bribe",meaning:"뇌물",hint2:"b로 시작, 5글자 (bride와 혼동 주의!)"},
+  {word:"bride",meaning:"신부",hint2:"b로 시작, 5글자 (bribe와 혼동 주의!)"},
+  {word:"venture forth",meaning:"위험을 무릅쓰다",hint2:"venture=모험 / forth=앞으로"},
+  {word:"sink down in despair",meaning:"절망에 빠지다",hint2:"sink=가라앉다 / despair=절망"},
+],
+"Day 45":[
+  {word:"shred",meaning:"조각/단편",hint2:"sh로 시작, 5글자"},
+  {word:"viable",meaning:"실행 가능한",hint2:"via(길) + ble → 길이 있는"},
+  {word:"shiver",meaning:"떨다(추위)",hint2:"sh로 시작 / 추위에 떨다"},
+  {word:"shudder",meaning:"떨다(공포)",hint2:"shud + der → 공포로 떨다"},
+  {word:"deficiency",meaning:"결핍",hint2:"de(부족) + fici(만들다) + ency"},
+  {word:"remain self-complacent",meaning:"자만하다",hint2:"complacent=자기만족의"},
+  {word:"mundane matters",meaning:"일상적인 일들",hint2:"mundane=세속적인"},
+  {word:"grumble",meaning:"투덜대다",hint2:"grum(으르렁) + ble"},
+  {word:"misgiving",meaning:"걱정/불안",hint2:"mis(잘못) + giving(주다)"},
+  {word:"submerge",meaning:"물속에 담그다",hint2:"sub(아래) + merge(합치다)"},
+  {word:"blatant discrimination",meaning:"노골적인 차별",hint2:"blatant=뻔뻔스러운/노골적인"},
+  {word:"sympathy",meaning:"불쌍함을 느끼는 마음",hint2:"sym(함께) + pathy(감정)"},
+  {word:"empathy",meaning:"서로 이해하는 마음",hint2:"em(안에) + pathy(감정)"},
+  {word:"incinerate",meaning:"태우다",hint2:"in + ciner(재) + ate → 재로 만들다"},
+  {word:"tenacious",meaning:"집요한/완강한",hint2:"ten(잡다) + acious"},
+  {word:"retrogression",meaning:"후퇴",hint2:"retro(뒤로) + gress(가다) + ion"},
+  {word:"ingenious",meaning:"독창적인",hint2:"ingen(타고난 재능) + ious"},
+  {word:"ingenuity",meaning:"기발한 재주",hint2:"ingenious의 명사형"},
+  {word:"ingenuous",meaning:"순수한",hint2:"ingen + uous → ingenious와 혼동 주의!"},
+  {word:"stagger",meaning:"큰 충격을 주다/비틀거리다",hint2:"stag + ger → 비틀거리며 걷다"},
+  {word:"suffocate",meaning:"질식하다",hint2:"suf + foc(목) + ate"},
+  {word:"wrath",meaning:"분노",hint2:"w로 시작, 5글자"},
+  {word:"divine",meaning:"신의/신성한",hint2:"divin(신) + e"},
+  {word:"aesthetic",meaning:"미학의",hint2:"aesth(감각) + etic"},
+  {word:"bail out the bank",meaning:"은행을 구제하다",hint2:"bail out=구제하다"},
+],
+"Day 46":[
+  {word:"expansive delusion",meaning:"과대망상",hint2:"expansive=팽창하는 / delusion=망상"},
+  {word:"a vicious cycle",meaning:"악순환",hint2:"vicious=악의적인 / cycle=순환"},
+  {word:"malicious",meaning:"악의적인",hint2:"mali(나쁜) + cious"},
+  {word:"meddle",meaning:"간섭하다",hint2:"med + dle → 끼어들다"},
+  {word:"foreboding",meaning:"불길한 예감",hint2:"fore(앞에) + boding(예감)"},
+  {word:"turmoil",meaning:"혼란/무질서",hint2:"tur(돌다) + moil(수고)"},
+  {word:"invincible",meaning:"정복할 수 없는",hint2:"in(부정) + vincible(정복가능한)"},
+  {word:"susceptible",meaning:"영향받기 쉬운",hint2:"sus + cept(받다) + ible"},
+  {word:"culminate",meaning:"정점에 이르다",hint2:"culmin(꼭대기) + ate"},
+  {word:"conspire",meaning:"공모하다",hint2:"con(함께) + spire(숨쉬다)"},
+  {word:"flicker",meaning:"깜박이다",hint2:"flick(튀기다) + er"},
+  {word:"epidemic",meaning:"전염병",hint2:"epi(위에) + demic(사람들)"},
+  {word:"ailment",meaning:"질병/고통",hint2:"ail(아프다) + ment"},
+  {word:"lament",meaning:"슬퍼하다",hint2:"la + ment(마음) → 마음이 아프다"},
+  {word:"pervasive",meaning:"퍼지는",hint2:"per(통해서) + vas(가다) + ive"},
+  {word:"luminescent",meaning:"발광의",hint2:"lumin(빛) + escent"},
+  {word:"homage",meaning:"존경",hint2:"hom(사람) + age → 경의"},
+  {word:"mutation",meaning:"돌연변이",hint2:"mut(변하다) + ation"},
+  {word:"improvise",meaning:"즉흥 연주하다",hint2:"im + provis(미리 보다)"},
+  {word:"decadence",meaning:"타락",hint2:"deca(쇠퇴) + dence"},
+  {word:"precipitation",meaning:"강수량",hint2:"pre + cipit(떨어지다) + ation"},
+  {word:"celestial",meaning:"천체의",hint2:"celest(하늘) + ial"},
+  {word:"affinity",meaning:"유사성/친밀감",hint2:"af + fin(끝,경계) + ity"},
+  {word:"hostility",meaning:"적개심",hint2:"hostil(적대적인) + ity"},
+  {word:"align",meaning:"정렬하다",hint2:"al + line(선) → 선을 맞추다"},
+  {word:"turn one's back on",meaning:"외면하다",hint2:"back(등) → 등을 돌리다"},
+  {word:"settle into",meaning:"자리 잡다",hint2:"settle(정착하다) + into"},
+]
+};
+
+// ── State ──
+let state = {
+  stage:'select', day:null, queue:[], idx:0, score:0, level:1,
+  h1:false, h2:false, h3:false, answered:false, feedback:null, levelUp:false,
+  ansVal:'', reviewList:[], reviewIdx:0, revVal:'', revAnswered:false, revFeedback:null,
+  running:false, combo:0, maxCombo:0, correct:0, wrong:0,
+  speedMode:false, timeLeft:15,
+  clearedDays: JSON.parse(localStorage.getItem('clearedDays')||'{}'),
+  currentGoal: JSON.parse(localStorage.getItem('currentGoal')||'null'),
+  goalAchieved:false, showGoalModal:false, musicOn:false,
+  goalType:'days', goalValue:3,
+  comboPopup:null, stats:null
+};
+
+let timerInterval=null, audioCtx=null, musicNodes=[], musicLoop=null;
+
+function shuffle(arr){const a=[...arr];for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;}
+function setState(patch){Object.assign(state,patch);render();}
+
+// ── Audio ──
+function getCtx(){if(!audioCtx)audioCtx=new (window.AudioContext||window.webkitAudioContext)();return audioCtx;}
+function stopMusic(){clearTimeout(musicLoop);musicNodes.forEach(n=>{try{n.stop(0);}catch(e){}});musicNodes=[];}
+function playMusicLoop(){
+  stopMusic();
+  const ctx=getCtx(),BPM=140,beat=60/BPM,now=ctx.currentTime,steps=32;
+  const mk=(f,t,d,type,vol,filter)=>{const o=ctx.createOscillator(),g=ctx.createGain();o.type=type||'sine';o.frequency.value=f;if(filter){const flt=ctx.createBiquadFilter();flt.type=filter.t;flt.frequency.value=filter.f;o.connect(flt);flt.connect(g);}else o.connect(g);g.connect(ctx.destination);g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(0.0001,t+d);o.start(t);o.stop(t+d+0.01);musicNodes.push(o);};
+  const noise=(t,d,vol,ft,ff)=>{const buf=ctx.createBuffer(1,ctx.sampleRate*d,ctx.sampleRate),dt=buf.getChannelData(0);for(let i=0;i<dt.length;i++)dt[i]=(Math.random()*2-1)*Math.pow(1-i/dt.length,1.5);const s=ctx.createBufferSource();s.buffer=buf;const g=ctx.createGain(),flt=ctx.createBiquadFilter();flt.type=ft;flt.frequency.value=ff;s.connect(flt);flt.connect(g);g.connect(ctx.destination);g.gain.setValueAtTime(vol,t);s.start(t);s.stop(t+d+0.01);musicNodes.push(s);};
+  for(let i=0;i<steps;i++){const t=now+i*beat;if(i%4===0||i%4===2){mk(140,t,.25,'sine',1.4,null);const o=ctx.createOscillator(),g=ctx.createGain();o.frequency.setValueAtTime(180,t);o.frequency.exponentialRampToValueAtTime(38,t+.18);o.connect(g);g.connect(ctx.destination);g.gain.setValueAtTime(1,t);g.gain.exponentialRampToValueAtTime(0.0001,t+.22);o.start(t);o.stop(t+.23);musicNodes.push(o);}if(i%4===1||i%4===3)noise(t,.14,.9,'bandpass',2200);noise(t,.04,i%2===0?.28:.14,'highpass',9000);}
+  [55,55,73,55,49,55,65,73].forEach((f,i)=>mk(f,now+i*beat,beat*.75,'sawtooth',.38,{t:'lowpass',f:320}));
+  [[220,277,330],[196,247,294]].forEach(ch=>{for(let i=0;i<steps;i++)if(i%4===1||i%4===3)ch.forEach(f=>mk(f,now+i*beat,.12,'square',.06,{t:'lowpass',f:1800}));});
+  [440,494,523,587,523,494,440,392,440,494,523,494,392,349,392,440].forEach((f,i)=>mk(f,now+i*(beat/2),beat*.45,'square',.07,{t:'lowpass',f:2400}));
+  musicLoop=setTimeout(()=>{if(state.musicOn)playMusicLoop();},steps*beat*1000-60);
+}
+function playSfx(type){
+  try{
+    const ctx=getCtx(),master=ctx.createGain();master.gain.value=.4;master.connect(ctx.destination);
+    if(type==='levelup'||type==='clear'){
+      const notes=type==='clear'?[523,659,784,880,1047,1174]:[523,659,784,1047];
+      notes.forEach((f,i)=>{const o=ctx.createOscillator(),g=ctx.createGain();o.type='square';o.frequency.value=f;o.connect(g);g.connect(master);const t=ctx.currentTime+i*.1;g.gain.setValueAtTime(.3,t);g.gain.exponentialRampToValueAtTime(.001,t+.25);o.start(t);o.stop(t+.26);});
+    }else if(type==='correct'){
+      [[880,0],[1100,.1]].forEach(([f,d])=>{const o=ctx.createOscillator(),g=ctx.createGain();o.type='sine';o.frequency.value=f;o.connect(g);g.connect(master);const t=ctx.currentTime+d;g.gain.setValueAtTime(.5,t);g.gain.exponentialRampToValueAtTime(.001,t+.18);o.start(t);o.stop(t+.19);});
+    }else if(type==='combo'){
+      const o=ctx.createOscillator(),g=ctx.createGain();o.type='sine';o.frequency.value=1320;o.connect(g);g.connect(master);g.gain.setValueAtTime(.4,ctx.currentTime);g.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.12);o.start(ctx.currentTime);o.stop(ctx.currentTime+.13);
+    }else if(type==='wrong'){
+      const o=ctx.createOscillator(),g=ctx.createGain();o.type='sawtooth';o.frequency.value=180;o.connect(g);g.connect(ctx.destination);g.gain.setValueAtTime(.25,ctx.currentTime);g.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.3);o.start(ctx.currentTime);o.stop(ctx.currentTime+.31);
+    }
+  }catch(e){}
+}
+
+// ── Actions ──
+function startDay(day,speed=false){
+  clearInterval(timerInterval);
+  setState({stage:'game',day,queue:shuffle(DAYS[day]),idx:0,score:0,level:1,
+    h1:false,h2:false,h3:false,answered:false,feedback:null,ansVal:'',
+    reviewList:[],reviewIdx:0,revVal:'',revAnswered:false,revFeedback:null,
+    running:false,combo:0,maxCombo:0,correct:0,wrong:0,
+    speedMode:speed,timeLeft:15,stats:null,goalAchieved:false});
+  setTimeout(()=>document.getElementById('ans')?.focus(),100);
+}
+
+function triggerRun(){setState({running:true});setTimeout(()=>setState({running:false}),800);}
+
+function addToReview(w){if(!state.reviewList.find(r=>r.word===w.word))setState({reviewList:[...state.reviewList,w]});}
+
+function useHint(n){
+  if(state.answered)return;
+  if(n===1&&!state.h1)setState({h1:true});
+  else if(n===2&&!state.h2)setState({h2:true});
+  else if(n===3&&!state.h3){addToReview(state.queue[state.idx]);setState({h3:true});}
+}
+
+function checkAnswer(){
+  if(state.answered||!state.ansVal.trim())return;
+  clearInterval(timerInterval);
+  const w=state.queue[state.idx];
+  const ans=state.ansVal.trim().toLowerCase(),correct=w.word.toLowerCase();
+  let pts=0;
+  if(!state.h3)pts=state.h2?50:state.h1?80:100;
+  if(ans===correct){
+    const newCombo=state.combo+1;
+    const bonus=newCombo>=3?Math.floor(pts*.1*(newCombo-2)):0;
+    const total=pts+bonus;
+    const ns=state.score+total,nl=Math.floor(ns/500)+1,isUp=nl>state.level;
+    const newMax=Math.max(state.maxCombo,newCombo);
+    if(isUp)playSfx('levelup');
+    else if(newCombo>=3)playSfx('combo');
+    else playSfx('correct');
+    triggerRun();
+    const msg=state.h3?'정답! (힌트3 사용 — 점수 없음)':`정답! +${pts}점${bonus>0?` 🔥콤보 +${bonus}점`:''}${newCombo>=2?` ${newCombo}콤보!`:''}`;
+    const comboPopup=newCombo>=3?newCombo:null;
+    setState({answered:true,score:ns,level:nl,combo:newCombo,maxCombo:newMax,correct:state.correct+1,
+      levelUp:isUp,feedback:{type:'correct',msg},comboPopup});
+    if(isUp)setTimeout(()=>setState({levelUp:false}),2200);
+    if(comboPopup)setTimeout(()=>setState({comboPopup:null}),900);
+  }else{
+    playSfx('wrong');addToReview(state.queue[state.idx]);
+    setState({answered:true,combo:0,wrong:state.wrong+1,feedback:{type:'wrong',msg:`오답! 정답: ${w.word} — 복습 추가됨`}});
+  }
+}
+
+function nextWord(){
+  const total=state.correct+state.wrong;
+  const accuracy=total>0?Math.round((state.correct/total)*100):0;
+  if(state.idx+1>=state.queue.length){
+    const stats={score:state.score,correct:state.correct,wrong:state.wrong,maxCombo:state.maxCombo,accuracy};
+    const newCleared={...state.clearedDays,[state.day]:{score:state.score,accuracy,date:new Date().toLocaleDateString()}};
+    localStorage.setItem('clearedDays',JSON.stringify(newCleared));
+    playSfx('clear');
+    let goalAchieved=false,updatedGoal=state.currentGoal;
+    if(state.currentGoal){
+      const prog=state.currentGoal.type==='days'?Object.keys(newCleared).length:Math.max(state.currentGoal.progress||0,state.score);
+      updatedGoal={...state.currentGoal,progress:prog};
+      localStorage.setItem('currentGoal',JSON.stringify(updatedGoal));
+      if((state.currentGoal.type==='days'&&prog>=state.currentGoal.value)||(state.currentGoal.type==='score'&&state.score>=state.currentGoal.value))goalAchieved=true;
+    }
+    if(state.reviewList.length>0){
+      setState({stats,clearedDays:newCleared,currentGoal:updatedGoal,goalAchieved,reviewIdx:0,revVal:'',revAnswered:false,revFeedback:null,stage:'review'});
+    }else{
+      setState({stats,clearedDays:newCleared,currentGoal:updatedGoal,goalAchieved,stage:'result'});
+    }
+    return;
+  }
+  clearInterval(timerInterval);
+  setState({idx:state.idx+1,h1:false,h2:false,h3:false,answered:false,feedback:null,ansVal:'',
+    timeLeft:15});
+  if(state.speedMode)startSpeedTimer();
+  setTimeout(()=>document.getElementById('ans')?.focus(),80);
+}
+
+function startSpeedTimer(){
+  clearInterval(timerInterval);
+  timerInterval=setInterval(()=>{
+    if(state.timeLeft<=1){
+      clearInterval(timerInterval);
+      addToReview(state.queue[state.idx]);
+      setState({answered:true,combo:0,wrong:state.wrong+1,timeLeft:0,feedback:{type:'wrong',msg:`시간 초과! 정답: ${state.queue[state.idx]?.word}`}});
+      playSfx('wrong');
+    }else setState({timeLeft:state.timeLeft-1});
+  },1000);
+}
+
+function checkReview(){
+  if(state.revAnswered||!state.revVal.trim())return;
+  const rw=state.reviewList[state.reviewIdx];
+  if(state.revVal.trim().toLowerCase()===rw.word.toLowerCase()){
+    playSfx('correct');setState({revAnswered:true,score:state.score+50,revFeedback:{type:'correct',msg:'정답! +50점 (복습 보너스)'}});
+  }else{
+    playSfx('wrong');setState({revAnswered:true,revFeedback:{type:'wrong',msg:`오답! 정답: ${rw.word}`}});
+  }
+}
+function nextReview(){
+  if(state.reviewIdx+1>=state.reviewList.length){setState({stage:'result'});return;}
+  setState({reviewIdx:state.reviewIdx+1,revVal:'',revAnswered:false,revFeedback:null});
+  setTimeout(()=>document.getElementById('rev-ans')?.focus(),80);
+}
+
+function saveGoal(){
+  const goal={type:state.goalType,value:Number(state.goalValue),
+    progress:state.goalType==='days'?Object.keys(state.clearedDays).length:0};
+  localStorage.setItem('currentGoal',JSON.stringify(goal));
+  setState({currentGoal:goal,goalAchieved:false,showGoalModal:false});
+}
+
+// ── Bear SVG ──
+function bearSVG(running){
+  const idle=`<g class="idle-body">
+    <ellipse cx="11" cy="5.5" rx="3.5" ry="3.5" fill="#e8ddd0"/><ellipse cx="11" cy="5.5" rx="2" ry="2" fill="#d4bfaa"/>
+    <ellipse cx="25" cy="5.5" rx="3.5" ry="3.5" fill="#e8ddd0"/><ellipse cx="25" cy="5.5" rx="2" ry="2" fill="#d4bfaa"/>
+    <path d="M23 3 Q25 1.5 27 3 Q25 4.5 23 3Z" fill="#f8a0b0"/><path d="M23 3 Q25 4.5 27 3 Q25 1.5 23 3Z" fill="#f4b8c4"/>
+    <circle cx="25" cy="3" r="0.8" fill="#e87090"/>
+    <ellipse cx="18" cy="9" rx="7.5" ry="7" fill="#e8ddd0"/><ellipse cx="18" cy="10.5" rx="4.5" ry="3.5" fill="#d4bfaa"/>
+    <circle cx="15.2" cy="8.5" r="1.1" fill="#1a0f0a"/><circle cx="20.8" cy="8.5" r="1.1" fill="#1a0f0a"/>
+    <circle cx="15.6" cy="8.1" r="0.35" fill="white"/><circle cx="21.2" cy="8.1" r="0.35" fill="white"/>
+    <ellipse cx="18" cy="11" rx="1.8" ry="1.2" fill="#7a4a35"/>
+    <path d="M16.5 12.5 Q18 13.5 19.5 12.5" stroke="#7a4a35" stroke-width="0.7" fill="none" stroke-linecap="round"/>
+    <ellipse cx="13.5" cy="11" rx="1.5" ry="0.9" fill="#f4a0b0" opacity="0.5"/><ellipse cx="22.5" cy="11" rx="1.5" ry="0.9" fill="#f4a0b0" opacity="0.5"/>
+    <rect x="14" y="16" width="8" height="4" rx="0.5" fill="white"/>
+    <path d="M11 16 L14 16 L18 18 L22 16 L25 16 L25 24 L11 24 Z" fill="#0f1f4a"/>
+    <path d="M14 16 L18 18 L18 24" stroke="#1a2f5e" stroke-width="0.5" fill="none"/>
+    <circle cx="21" cy="18" r="1.3" fill="white" stroke="#aaa" stroke-width="0.3"/><circle cx="21" cy="18" r="0.8" fill="#2d8a4a"/>
+    <rect x="12" y="24" width="12" height="6" rx="1" fill="#0f1f4a"/>
+    <line x1="14" y1="24" x2="13.5" y2="30" stroke="#1e3570" stroke-width="0.6"/>
+    <line x1="18" y1="24" x2="18" y2="30" stroke="#1e3570" stroke-width="0.6"/>
+    <line x1="22" y1="24" x2="22.5" y2="30" stroke="#1e3570" stroke-width="0.6"/>
+    <ellipse cx="9.5" cy="21" rx="2.2" ry="4" fill="#e8ddd0"/><ellipse cx="26.5" cy="21" rx="2.2" ry="4" fill="#e8ddd0"/>
+    <ellipse cx="15.5" cy="32" rx="2.2" ry="3" fill="#e8ddd0"/><ellipse cx="20.5" cy="32" rx="2.2" ry="3" fill="#e8ddd0"/>
+  </g>`;
+  const run=`<g class="run-body"><g class="run-tilt">
+    <ellipse cx="11" cy="5.5" rx="3.5" ry="3.5" fill="#e8ddd0"/><ellipse cx="11" cy="5.5" rx="2" ry="2" fill="#d4bfaa"/>
+    <ellipse cx="25" cy="5.5" rx="3.5" ry="3.5" fill="#e8ddd0"/><ellipse cx="25" cy="5.5" rx="2" ry="2" fill="#d4bfaa"/>
+    <path d="M23 3 Q25 1.5 27 3 Q25 4.5 23 3Z" fill="#f8a0b0"/><path d="M23 3 Q25 4.5 27 3 Q25 1.5 23 3Z" fill="#f4b8c4"/>
+    <circle cx="25" cy="3" r="0.8" fill="#e87090"/>
+    <ellipse cx="18" cy="9" rx="7.5" ry="7" fill="#e8ddd0"/><ellipse cx="18" cy="10.5" rx="4.5" ry="3.5" fill="#d4bfaa"/>
+    <path d="M14.2 8.2 Q15.2 7.2 16.2 8.2" stroke="#1a0f0a" stroke-width="0.9" fill="none" stroke-linecap="round"/>
+    <path d="M19.8 8.2 Q20.8 7.2 21.8 8.2" stroke="#1a0f0a" stroke-width="0.9" fill="none" stroke-linecap="round"/>
+    <ellipse cx="18" cy="11" rx="1.8" ry="1.2" fill="#7a4a35"/>
+    <path d="M15.5 12.5 Q18 14 20.5 12.5" stroke="#7a4a35" stroke-width="0.7" fill="none" stroke-linecap="round"/>
+    <ellipse cx="13.5" cy="11" rx="1.5" ry="0.9" fill="#f4a0b0" opacity="0.6"/><ellipse cx="22.5" cy="11" rx="1.5" ry="0.9" fill="#f4a0b0" opacity="0.6"/>
+    <rect x="14" y="16" width="8" height="4" rx="0.5" fill="white"/>
+    <path d="M11 16 L14 16 L18 18 L22 16 L25 16 L25 24 L11 24 Z" fill="#0f1f4a"/>
+    <circle cx="21" cy="18" r="1.3" fill="white" stroke="#aaa" stroke-width="0.3"/><circle cx="21" cy="18" r="0.8" fill="#2d8a4a"/>
+    <rect x="12" y="24" width="12" height="6" rx="1" fill="#0f1f4a"/>
+    <line x1="14" y1="24" x2="13.5" y2="30" stroke="#1e3570" stroke-width="0.6"/>
+    <line x1="18" y1="24" x2="18" y2="30" stroke="#1e3570" stroke-width="0.6"/>
+    <line x1="22" y1="24" x2="22.5" y2="30" stroke="#1e3570" stroke-width="0.6"/>
+    <g class="run-armL"><ellipse cx="9.5" cy="21" rx="2.2" ry="4" fill="#e8ddd0"/></g>
+    <g class="run-armR"><ellipse cx="26.5" cy="21" rx="2.2" ry="4" fill="#e8ddd0"/></g>
+    <g class="run-legL"><ellipse cx="15" cy="32" rx="2.2" ry="4" fill="#e8ddd0"/></g>
+    <g class="run-legR"><ellipse cx="21" cy="32" rx="2.2" ry="4" fill="#e8ddd0"/></g>
+  </g></g>`;
+  return `<svg viewBox="0 0 36 36" width="108" height="108" xmlns="http://www.w3.org/2000/svg">${running?run:idle}</svg>`;
+}
+
+// ── Render ──
+function render(){
+  const s=state;
+  const app=document.getElementById('app');
+  if(!app)return;
+
+  const inLevel=s.score%500, pct=(inLevel/500)*100;
+  const charX=Math.max(0,pct-9)+'%';
+  const fillColor=s.combo>=5?'linear-gradient(90deg,#ff3b30,#ff9f0a)':'linear-gradient(90deg,#34c759,#30d158)';
+
+  function scoreBar(){
+    return `<div style="margin-bottom:14px">
+      <div class="score-row">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="score-num">${s.score}점</div>
+          ${s.combo>=2?`<span class="combo-badge">🔥 ${s.combo}콤보!</span>`:''}
+        </div>
+        <div style="font-size:12px;color:var(--text2)">${inLevel} / 500</div>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress-track"><div class="progress-fill" style="width:${pct}%;background:${fillColor}"></div></div>
+        <div class="bear-wrap" style="left:${charX}">${bearSVG(s.running)}</div>
+        ${s.comboPopup?`<div style="position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:22px;font-weight:600;color:var(--red);pointer-events:none">🔥 ${s.comboPopup}콤보!</div>`:''}
+        <span class="flag">🏁</span>
+      </div>
+    </div>`;
+  }
+
+  function topBar(label){
+    return `<div class="topbar">
+      <button class="btn" onclick="setState({stage:'select'})" style="font-size:12px;padding:6px 12px">← Day 선택</button>
+      <div style="font-size:13px;font-weight:500;color:var(--text2)">${label||s.day}${s.speedMode?'<span style="margin-left:6px;font-size:10px;background:var(--red-bg);color:var(--red-text);padding:1px 6px;border-radius:4px">⚡ 스피드</span>':''}</div>
+      <div class="topbar-right">
+        <span class="level-badge">Lv.${s.level}</span>
+        <button class="music-btn ${s.musicOn?'on':''}" onclick="toggleMusic()">${s.musicOn?'♪ ON':'♪ OFF'}</button>
+      </div>
+    </div>`;
+  }
+
+  // Goal modal
+  if(s.showGoalModal){
+    app.innerHTML=`<div style="padding:16px">
+      <div style="font-size:18px;font-weight:500;margin-bottom:16px">🎯 목표 설정</div>
+      <div class="card" style="margin-bottom:12px">
+        <div class="section-title">목표 유형</div>
+        <div style="display:flex;gap:8px;margin-bottom:14px;margin-top:6px">
+          <button class="btn ${s.goalType==='days'?'btn-blue':''}" style="flex:1" onclick="setState({goalType:'days'})">Day 클리어 수</button>
+          <button class="btn ${s.goalType==='score'?'btn-blue':''}" style="flex:1" onclick="setState({goalType:'score'})">점수 달성</button>
+        </div>
+        <div class="section-title">${s.goalType==='days'?'클리어할 Day 수':'목표 점수'}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+          ${(s.goalType==='days'?[1,3,5,10]:[500,1000,2000,5000]).map(v=>`<button class="btn ${s.goalValue==v?'btn-blue':''}" onclick="setState({goalValue:${v}})">${v}${s.goalType==='score'?'점':''}</button>`).join('')}
+        </div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn" style="flex:1" onclick="setState({showGoalModal:false})">취소</button>
+        <button class="btn btn-primary" style="flex:2" onclick="saveGoal()">설정 완료</button>
+      </div>
+    </div>`;
+    return;
+  }
+
+  // Select
+  if(s.stage==='select'){
+    const goal=s.currentGoal;
+    const goalProg=goal?Math.min(100,((goal.progress||0)/goal.value)*100):0;
+    app.innerHTML=`<div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px">
+        <div>
+          <div style="font-size:20px;font-weight:600">영단어 스펠링 게임</div>
+          <div style="font-size:12px;color:var(--text2);margin-top:2px">숙명여고 2학년 1학기</div>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="music-btn ${s.musicOn?'on':''}" onclick="toggleMusic()" style="font-size:13px;padding:6px 12px">${s.musicOn?'♪ ON':'♪ OFF'}</button>
+          <button class="btn" style="font-size:12px;padding:6px 12px" onclick="setState({showGoalModal:true})">🎯 목표</button>
+          <button class="btn btn-blue" style="font-size:12px;padding:6px 12px" onclick="downloadHTML()">⬇️ 저장</button>
+        </div>
+      </div>
+      ${goal?`<div class="card" style="margin-bottom:14px;background:${s.goalAchieved?'var(--green-bg)':'var(--card)'}">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <span style="font-size:13px;font-weight:500;color:${s.goalAchieved?'var(--green-text)':'var(--text)'}">${s.goalAchieved?'🎉 목표 달성!':'🎯 현재 목표'}</span>
+          <span style="font-size:12px;color:var(--text2)">${goal.type==='days'?`${goal.progress||0} / ${goal.value} Day`:`${goal.progress||0} / ${goal.value}점`}</span>
+        </div>
+        <div class="goal-bar-wrap"><div class="goal-bar-fill" style="width:${goalProg}%;background:${s.goalAchieved?'var(--green)':'var(--blue)'}"></div></div>
+      </div>`:''}
+      <div class="day-grid">
+        ${Object.keys(DAYS).map(day=>{
+          const cl=s.clearedDays[day];
+          return `<button class="day-card ${cl?'cleared':''}" onclick="startDay('${day}')">
+            ${cl?`<div class="clear-badge"><span>CLEAR</span><span style="font-size:6px">${cl.accuracy}%</span></div>`:''}
+            <div style="font-size:15px;font-weight:600;margin-bottom:2px">${day}</div>
+            <div style="font-size:11px;color:var(--text2);margin-bottom:${cl?'4px':'10px'}">${DAYS[day].length}개 단어</div>
+            ${cl?`<div style="font-size:10px;color:var(--red);font-weight:500">최고 ${cl.score}점</div>`:`<div style="font-size:12px;color:#1a7a38;font-weight:500">시작 →</div>`}
+          </button>`;
+        }).join('')}
+      </div>
+      <div class="card" style="margin-top:14px;display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <div style="font-size:13px;font-weight:500">⚡ 스피드 모드</div>
+          <div style="font-size:11px;color:var(--text2)">15초 안에 답하기!</div>
+        </div>
+        <select onchange="if(this.value){startDay(this.value,true);this.value='';}" style="font-size:12px;padding:6px 10px;border-radius:10px;border:1px solid var(--border);background:var(--card);color:var(--text)">
+          <option value="" disabled selected>Day 선택</option>
+          ${Object.keys(DAYS).map(d=>`<option value="${d}">${d}</option>`).join('')}
+        </select>
+      </div>
+    </div>`;
+    return;
+  }
+
+  // Result
+  if(s.stage==='result'){
+    const st=s.stats||{score:s.score,correct:s.correct,wrong:s.wrong,maxCombo:s.maxCombo,accuracy:Math.round((s.correct/(s.correct+s.wrong+.001))*100)};
+    app.innerHTML=`<div style="padding:8px 0">
+      <div style="text-align:center;margin-bottom:20px">
+        <div style="font-size:40px;margin-bottom:8px">🎉</div>
+        <div style="font-size:20px;font-weight:600;margin-bottom:4px">${s.day} 클리어!</div>
+        <div style="font-size:32px;font-weight:600;color:#1a7a38">${st.score}점</div>
+        ${s.goalAchieved?`<div style="margin-top:8px;font-size:14px;font-weight:500;color:var(--green-text);background:var(--green-bg);padding:6px 14px;border-radius:10px;display:inline-block">🎯 목표 달성!</div>`:''}
+      </div>
+      <div class="stats-grid">
+        ${[['정답 수',st.correct+'개','#1a7a38'],['오답 수',st.wrong+'개','#a82019'],['정확도',st.accuracy+'%','#003d99'],['최고 콤보',st.maxCombo+'연속','#a82019']].map(([l,v,c])=>`
+          <div class="stat-card"><div style="font-size:11px;color:var(--text2);margin-bottom:4px">${l}</div><div style="font-size:22px;font-weight:600;color:${c}">${v}</div></div>
+        `).join('')}
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center">
+        <button class="btn" onclick="startDay('${s.day}')">다시 풀기</button>
+        <button class="btn btn-red" onclick="startDay('${s.day}',true)">⚡ 스피드 모드</button>
+        <button class="btn" onclick="setState({stage:'select'})">Day 선택으로</button>
+      </div>
+    </div>`;
+    return;
+  }
+
+  // Review
+  if(s.stage==='review'){
+    const rw=s.reviewList[s.reviewIdx];
+    app.innerHTML=`<div>
+      ${topBar(s.day+' — 복습')}
+      ${scoreBar()}
+      <div style="font-size:12px;color:#854F0B;text-align:right;margin-bottom:6px">복습 ${s.reviewIdx+1} / ${s.reviewList.length}</div>
+      <div class="card" style="border:1.5px solid var(--yellow);margin-bottom:10px">
+        <div style="font-size:11px;color:#854F0B;margin-bottom:6px">오답/힌트3 사용 단어 — 다시 도전!</div>
+        <div style="font-size:22px;font-weight:500;margin-bottom:14px">${rw.meaning}</div>
+        <div class="answer-row">
+          <input id="rev-ans" class="answer-input" type="text" value="${s.revVal}" placeholder="영어 스펠링 입력..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" lang="en" ${s.revAnswered?'disabled':''} oninput="state.revVal=this.value" onkeydown="if(event.key==='Enter'){event.preventDefault();${s.revAnswered?'nextReview()':'checkReview()'}}">
+          ${s.revAnswered
+            ?`<button class="btn btn-green" onclick="nextReview()">${s.reviewIdx+1>=s.reviewList.length?'결과 보기':'다음 →'}</button>`
+            :`<button class="btn btn-primary" onclick="checkReview()">확인</button>`}
+        </div>
+      </div>
+      ${s.revFeedback?`<div class="feedback ${s.revFeedback.type}">${s.revFeedback.msg}</div>`:''}
+    </div>`;
+    setTimeout(()=>document.getElementById('rev-ans')?.focus(),80);
+    return;
+  }
+
+  // Game
+  const w=s.queue[s.idx];
+  if(!w)return;
+  const wordLen=w.word.split(' ').length;
+  const lenLabel=wordLen>1?`${wordLen}단어 / 총 ${w.word.replace(/ /g,'').length}글자`:`${w.word.length}글자`;
+
+  app.innerHTML=`<div>
+    ${topBar()}
+    ${scoreBar()}
+    ${s.levelUp?`<div style="background:var(--green-bg);color:var(--green-text);border:1px solid #a3d9b1;border-radius:12px;padding:10px;text-align:center;font-size:15px;font-weight:500;margin-bottom:10px">🎉 레벨업! Level ${s.level} 달성!</div>`:''}
+    ${s.speedMode?`<div class="timer-wrap">
+      <div class="timer-track"><div class="timer-fill" style="width:${(s.timeLeft/15)*100}%;background:${s.timeLeft<=5?'var(--red)':'var(--blue)'}"></div></div>
+      <span style="font-size:13px;font-weight:500;color:${s.timeLeft<=5?'var(--red)':'var(--text2)'};min-width:28px">${s.timeLeft}초</span>
+    </div>`:''}
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <span style="font-size:12px;color:var(--text2)">${s.idx+1} / ${s.queue.length}</span>
+      <div style="display:flex;gap:6px">
+        ${s.reviewList.length>0?`<span class="review-badge">복습 예정 ${s.reviewList.length}개</span>`:''}
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <span style="font-size:11px;color:var(--text2)">이 단어의 영어 스펠링은?</span>
+        <span class="word-count-badge">${lenLabel}</span>
+      </div>
+      <div style="font-size:22px;font-weight:500;margin-bottom:14px">${w.meaning}</div>
+      ${s.h1?`<div class="hint-box green">첫 글자: <strong>${w.word[0].toUpperCase()}</strong>${'_ '.repeat(w.word.replace(/ /g,'').length-1).trim()}</div>`:''}
+      ${s.h2?`<div class="hint-box yellow">${w.hint2}</div>`:''}
+      ${s.h3?`<div class="hint-box red">정답: <strong style="font-size:16px;letter-spacing:.05em">${w.word}</strong> <span style="font-size:11px;color:var(--red-text)">복습 추가됨</span></div>`:''}
+      ${!s.answered?`<div class="hint-row">
+        <button class="hint-btn" ${s.h1?'disabled':''} onclick="useHint(1)">💡 앞글자 (-20점) [1]</button>
+        <button class="hint-btn" ${s.h2?'disabled':''} onclick="useHint(2)">💡 어원 (-50점) [2]</button>
+        <button class="hint-btn red" ${s.h3?'disabled':''} onclick="useHint(3)">👁 정답보기 (0점) [3]</button>
+      </div>`:''}
+      <div class="answer-row">
+        <input id="ans" class="answer-input" type="text" value="${s.ansVal.replace(/"/g,'&quot;')}" placeholder="영어 스펠링 입력..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" lang="en"
+          oninput="state.ansVal=this.value"
+          onkeydown="const k=event.key;if(k==='Enter'){event.preventDefault();${s.answered?'nextWord()':'checkAnswer()'};return;}if(!state.answered){if(k==='1'){event.preventDefault();useHint(1);}if(k==='2'){event.preventDefault();useHint(2);}if(k==='3'){event.preventDefault();useHint(3);}}">
+        ${s.answered
+          ?`<button class="btn btn-green" onclick="nextWord()">${s.idx+1>=s.queue.length?(s.reviewList.length>0?'복습 시작 →':'결과 보기'):'다음 →'}</button>`
+          :`<button class="btn btn-primary" onclick="checkAnswer()">확인</button>`}
+      </div>
+    </div>
+    ${s.feedback?`<div class="feedback ${s.feedback.type}">${s.feedback.msg}</div>`:''}
+  </div>`;
+
+  const ansEl=document.getElementById('ans');
+  if(ansEl&&!s.answered){setTimeout(()=>ansEl.focus(),50);}
+  if(s.speedMode&&!s.answered&&!timerInterval){startSpeedTimer();}
+}
+
+function toggleMusic(){
+  if(state.musicOn){stopMusic();setState({musicOn:false});}
+  else{playMusicLoop();setState({musicOn:true});}
+}
+
+function downloadHTML(){
+  const html = document.documentElement.outerHTML;
+  const blob = new Blob([html], {type:'text/html;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '영단어_스펠링_게임.html';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// Init
+render();
+</script>
+
+
+</body></html>
